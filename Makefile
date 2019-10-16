@@ -610,6 +610,13 @@ ifdef CONFIG_FUNCTION_TRACER
   CC_FLAGS_FTRACE := -pg
 endif
 
+ifeq ($(cc-name),clang)
+CLANG_RANDSTRUCT_DETECT := $(shell $(CONFIG_SHELL) $(srctree)/scripts/clang-randstruct-detect.sh $(CC))
+ifeq ($(CLANG_RANDSTRUCT_DETECT),supported)
+KBUILD_CFLAGS += -DCLANG_RANDSTRUCT_SUPPORT -randstruct-seed-filename=$(objtree)/include/generated/randomization_seed.h
+endif
+endif
+
 # Make toolchain changes before including arch/$(SRCARCH)/Makefile to ensure
 # ar/cc/ld-* macros return correct values.
 ifdef CONFIG_LTO_CLANG
@@ -1164,7 +1171,8 @@ endif
 # that need to depend on updated CONFIG_* values can be checked here.
 prepare2: prepare3 outputmakefile asm-generic
 
-prepare1: prepare2 $(version_h) $(autoksyms_h) include/generated/utsrelease.h
+prepare1: prepare2 $(version_h) $(autoksyms_h) include/generated/utsrelease.h \
+	include/generated/randomization_seed.h
 	$(cmd_crmodverdir)
 
 archprepare: archheaders archscripts prepare1 scripts_basic
@@ -1222,6 +1230,14 @@ $(version_h): FORCE
 
 include/generated/utsrelease.h: include/config/kernel.release FORCE
 	$(call filechk,utsrelease.h)
+
+quiet_cmd_create_randomize_layout_seed = GENSEED $@
+cmd_create_randomize_layout_seed = \
+  $(CONFIG_SHELL) $(srctree)/scripts/gcc-plugins/gen-random-seed.sh \
+    $@ $(objtree)/include/generated/randomization_seed.h
+
+include/generated/randomization_seed.h: include/config/kernel.release FORCE
+	$(call if_changed,create_randomize_layout_seed)
 
 PHONY += headerdep
 headerdep:

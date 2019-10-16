@@ -90,7 +90,7 @@ TMPOUT := $(if $(KBUILD_EXTMOD),$(firstword $(KBUILD_EXTMOD))/)
 try-run = $(shell set -e;		\
 	TMP="$(TMPOUT).$$$$.tmp";	\
 	TMPO="$(TMPOUT).$$$$.o";	\
-	if ($(1)) >/dev/null 2>&1;	\
+	if ($(filter-out -randstruct-seed-filename=%,$(1))) >/dev/null 2>&1;    \
 	then echo "$(2)";		\
 	else echo "$(3)";		\
 	fi;				\

@@ -27,11 +27,13 @@
 #define __no_sanitize_address
 #endif
 
+#ifdef CLANG_RANDSTRUCT_SUPPORT
 #define __randomize_layout __attribute__((randomize_layout))
 #define __no_randomize_layout __attribute__((no_randomize_layout))
 /* This anon struct can add padding, so only enable it under randstruct. */
 #define randomized_struct_fields_start	struct {
 #define randomized_struct_fields_end	} __randomize_layout;
+#endif
 
 /*
  * Not all versions of clang implement the the type-generic versions
