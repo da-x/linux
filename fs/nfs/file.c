@@ -339,6 +339,8 @@ static int nfs_write_begin(struct file *file, struct address_space *mapping,
 			   loff_t pos, unsigned len, struct page **pagep,
 			   void **fsdata)
 {
+	fgf_t fgp = FGP_WRITEBEGIN;
+
 	struct folio *folio;
 	int once_thru = 0;
 	int ret;
@@ -347,7 +349,8 @@ static int nfs_write_begin(struct file *file, struct address_space *mapping,
 		file, mapping->host->i_ino, len, (long long) pos);
 
 start:
-	folio = __filemap_get_folio(mapping, pos >> PAGE_SHIFT, FGP_WRITEBEGIN,
+	fgp |= fgf_set_order(len);
+	folio = __filemap_get_folio(mapping, pos >> PAGE_SHIFT, fgp,
 				    mapping_gfp_mask(mapping));
 	if (IS_ERR(folio))
 		return PTR_ERR(folio);
