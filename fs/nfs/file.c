@@ -328,6 +328,167 @@ static bool nfs_want_read_modify_write(struct file *file, struct folio *folio,
 }
 
 /*
+ * This is a copy of the unexported filemap_get_entry from v6.9.
+ */
+static void *nfs_filemap_get_entry(struct address_space *mapping, pgoff_t index)
+{
+	XA_STATE(xas, &mapping->i_pages, index);
+	struct folio *folio;
+
+	rcu_read_lock();
+repeat:
+	xas_reset(&xas);
+	folio = xas_load(&xas);
+	if (xas_retry(&xas, folio))
+		goto repeat;
+	/*
+	 * A shadow entry of a recently evicted page, or a swap entry from
+	 * shmem/tmpfs.  Return it without attempting to raise page count.
+	 */
+	if (!folio || xa_is_value(folio))
+		goto out;
+
+	if (!folio_try_get_rcu(folio))
+		goto repeat;
+
+	if (unlikely(folio != xas_reload(&xas))) {
+		folio_put(folio);
+		goto repeat;
+	}
+out:
+	rcu_read_unlock();
+
+	return folio;
+}
+
+/*
+ * This a version of __filemap_get_folio from v6.9, that has the change:
+ *
+ * 'filemap: Allow __filemap_get_folio to allocate large folios'
+ *
+ * Which is needed to be able to allocate large folios.
+ */
+#define __filemap_get_folio __filemap_get_folio_6_19
+/**
+ * __filemap_get_folio - Find and get a reference to a folio.
+ * @mapping: The address_space to search.
+ * @index: The page index.
+ * @fgp_flags: %FGP flags modify how the folio is returned.
+ * @gfp: Memory allocation flags to use if %FGP_CREAT is specified.
+ *
+ * Looks up the page cache entry at @mapping & @index.
+ *
+ * If %FGP_LOCK or %FGP_CREAT are specified then the function may sleep even
+ * if the %GFP flags specified for %FGP_CREAT are atomic.
+ *
+ * If this function returns a folio, it is returned with an increased refcount.
+ *
+ * Return: The found folio or an ERR_PTR() otherwise.
+ */
+struct folio *__filemap_get_folio(struct address_space *mapping, pgoff_t index,
+		fgf_t fgp_flags, gfp_t gfp)
+{
+	struct folio *folio;
+
+repeat:
+	folio = nfs_filemap_get_entry(mapping, index);
+	if (xa_is_value(folio))
+		folio = NULL;
+	if (!folio)
+		goto no_page;
+
+	if (fgp_flags & FGP_LOCK) {
+		if (fgp_flags & FGP_NOWAIT) {
+			if (!folio_trylock(folio)) {
+				folio_put(folio);
+				return ERR_PTR(-EAGAIN);
+			}
+		} else {
+			folio_lock(folio);
+		}
+
+		/* Has the page been truncated? */
+		if (unlikely(folio->mapping != mapping)) {
+			folio_unlock(folio);
+			folio_put(folio);
+			goto repeat;
+		}
+		VM_BUG_ON_FOLIO(!folio_contains(folio, index), folio);
+	}
+
+	if (fgp_flags & FGP_ACCESSED)
+		folio_mark_accessed(folio);
+	else if (fgp_flags & FGP_WRITE) {
+		/* Clear idle flag for buffer write */
+		if (folio_test_idle(folio))
+			folio_clear_idle(folio);
+	}
+
+	if (fgp_flags & FGP_STABLE)
+		folio_wait_stable(folio);
+no_page:
+	if (!folio && (fgp_flags & FGP_CREAT)) {
+		unsigned order = FGF_GET_ORDER(fgp_flags);
+		int err;
+
+		if ((fgp_flags & FGP_WRITE) && mapping_can_writeback(mapping))
+			gfp |= __GFP_WRITE;
+		if (fgp_flags & FGP_NOFS)
+			gfp &= ~__GFP_FS;
+		if (fgp_flags & FGP_NOWAIT) {
+			gfp &= ~GFP_KERNEL;
+			gfp |= GFP_NOWAIT | __GFP_NOWARN;
+		}
+		if (WARN_ON_ONCE(!(fgp_flags & (FGP_LOCK | FGP_FOR_MMAP))))
+			fgp_flags |= FGP_LOCK;
+
+		if (!mapping_large_folio_support(mapping))
+			order = 0;
+		if (order > MAX_PAGECACHE_ORDER)
+			order = MAX_PAGECACHE_ORDER;
+		/* If we're not aligned, allocate a smaller folio */
+		if (index & ((1UL << order) - 1))
+			order = __ffs(index);
+
+		do {
+			gfp_t alloc_gfp = gfp;
+
+			err = -ENOMEM;
+			if (order > 0)
+				alloc_gfp |= __GFP_NORETRY | __GFP_NOWARN;
+			folio = filemap_alloc_folio(alloc_gfp, order);
+			if (!folio)
+				continue;
+
+			/* Init accessed so avoid atomic mark_page_accessed later */
+			if (fgp_flags & FGP_ACCESSED)
+				__folio_set_referenced(folio);
+
+			err = filemap_add_folio(mapping, folio, index, gfp);
+			if (!err)
+				break;
+			folio_put(folio);
+			folio = NULL;
+		} while (order-- > 0);
+
+		if (err == -EEXIST)
+			goto repeat;
+		if (err)
+			return ERR_PTR(err);
+		/*
+		 * filemap_add_folio locks the page, and for mmap
+		 * we expect an unlocked page.
+		 */
+		if (folio && (fgp_flags & FGP_FOR_MMAP))
+			folio_unlock(folio);
+	}
+
+	if (!folio)
+		return ERR_PTR(-ENOENT);
+	return folio;
+}
+
+/*
  * This does the "real" work of the write. We must allocate and lock the
  * page to be sent back to the generic routine, which then copies the
  * data from user space.
@@ -637,6 +798,12 @@ static const struct vm_operations_struct nfs_file_vm_ops = {
 	.page_mkwrite = nfs_vm_page_mkwrite,
 };
 
+static inline size_t nfs_copy_folio_from_iter_atomic(struct folio *folio,
+               size_t offset, size_t bytes, struct iov_iter *i)
+{
+       return copy_page_from_iter_atomic(&folio->page, offset, bytes, i);
+}
+
 /* Return the maximum folio size for this pagecache mapping, in bytes. */
 static inline size_t nfs_mapping_max_folio_size(struct address_space *mapping)
 {
@@ -698,7 +865,7 @@ retry:
                 if (mapping_writably_mapped(mapping))
                         flush_dcache_folio(folio);
 
-                copied = copy_folio_from_iter_atomic(folio, offset, bytes, i);
+                copied = nfs_copy_folio_from_iter_atomic(folio, offset, bytes, i);
                 flush_dcache_folio(folio);
 
                 status = a_ops->write_end(file, mapping, pos, bytes, copied,
