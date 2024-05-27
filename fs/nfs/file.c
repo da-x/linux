@@ -637,6 +637,104 @@ static const struct vm_operations_struct nfs_file_vm_ops = {
 	.page_mkwrite = nfs_vm_page_mkwrite,
 };
 
+/* Return the maximum folio size for this pagecache mapping, in bytes. */
+static inline size_t nfs_mapping_max_folio_size(struct address_space *mapping)
+{
+       if (mapping_large_folio_support(mapping))
+               return PAGE_SIZE << MAX_PAGECACHE_ORDER;
+       return PAGE_SIZE;
+}
+
+static ssize_t nfs_generic_perform_write(struct kiocb *iocb, struct iov_iter *i)
+{
+        struct file *file = iocb->ki_filp;
+        loff_t pos = iocb->ki_pos;
+        struct address_space *mapping = file->f_mapping;
+        const struct address_space_operations *a_ops = mapping->a_ops;
+        size_t chunk = nfs_mapping_max_folio_size(mapping);
+        long status = 0;
+        ssize_t written = 0;
+
+        do {
+                struct page *page;
+                struct folio *folio;
+                size_t offset;          /* Offset into folio */
+                size_t bytes;           /* Bytes to write to folio */
+                size_t copied;          /* Bytes copied from user */
+                void *fsdata = NULL;
+
+                bytes = iov_iter_count(i);
+retry:
+                offset = pos & (chunk - 1);
+                bytes = min(chunk - offset, bytes);
+                balance_dirty_pages_ratelimited(mapping);
+
+                /*
+                 * Bring in the user page that we will copy from _first_.
+                 * Otherwise there's a nasty deadlock on copying from the
+                 * same page as we're writing to, without it being marked
+                 * up-to-date.
+                 */
+                if (unlikely(fault_in_iov_iter_readable(i, bytes) == bytes)) {
+                        status = -EFAULT;
+                        break;
+                }
+
+                if (fatal_signal_pending(current)) {
+                        status = -EINTR;
+                        break;
+                }
+
+                status = a_ops->write_begin(file, mapping, pos, bytes,
+                                                &page, &fsdata);
+                if (unlikely(status < 0))
+                        break;
+
+                folio = page_folio(page);
+                offset = offset_in_folio(folio, pos);
+                if (bytes > folio_size(folio) - offset)
+                        bytes = folio_size(folio) - offset;
+
+                if (mapping_writably_mapped(mapping))
+                        flush_dcache_folio(folio);
+
+                copied = copy_folio_from_iter_atomic(folio, offset, bytes, i);
+                flush_dcache_folio(folio);
+
+                status = a_ops->write_end(file, mapping, pos, bytes, copied,
+                                                page, fsdata);
+                if (unlikely(status != copied)) {
+                        iov_iter_revert(i, copied - max(status, 0L));
+                        if (unlikely(status < 0))
+                                break;
+                }
+                cond_resched();
+
+                if (unlikely(status == 0)) {
+                        /*
+                         * A short copy made ->write_end() reject the
+                         * thing entirely.  Might be memory poisoning
+                         * halfway through, might be a race with munmap,
+                         * might be severe memory pressure.
+                         */
+                        if (chunk > PAGE_SIZE)
+                                chunk /= 2;
+                        if (copied) {
+                                bytes = copied;
+                                goto retry;
+                        }
+                } else {
+                        pos += status;
+                        written += status;
+                }
+        } while (iov_iter_count(i));
+
+        if (!written)
+                return status;
+        iocb->ki_pos += written;
+        return written;
+}
+
 ssize_t nfs_file_write(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -673,7 +771,7 @@ ssize_t nfs_file_write(struct kiocb *iocb, struct iov_iter *from)
 	nfs_start_io_write(inode);
 	result = generic_write_checks(iocb, from);
 	if (result > 0)
-		result = generic_perform_write(iocb, from);
+		result = nfs_generic_perform_write(iocb, from);
 	nfs_end_io_write(inode);
 	if (result <= 0)
 		goto out;
